@@ -4,181 +4,185 @@ const { parseTestPdf } = require('../lib/parseTest');
 const { parseSolutionPdf } = require('../lib/parseSolution');
 const { buildOutput } = require('../lib/buildOutput');
 
-const bot = new Telegraf(process.env.BOT_TOKEN);
+// Lazy-init bot (avoids issues if BOT_TOKEN not set during cold start)
+let bot;
+function getBot() {
+  if (!bot) {
+    bot = new Telegraf(process.env.BOT_TOKEN);
+    registerHandlers(bot);
+  }
+  return bot;
+}
 
-// In-memory state per chat: { step: 'wait_test'|'wait_sol', testBuffer, testName }
+// In-memory state per chat
 const state = new Map();
 
-// ── Download a Telegram file into a Buffer ───────────────────────────────────
+// Download Telegram file as Buffer
 async function downloadFile(fileId) {
   const token = process.env.BOT_TOKEN;
-  const infoUrl = `https://api.telegram.org/bot${token}/getFile?file_id=${fileId}`;
-  const { data: info } = await axios.get(infoUrl);
+  const { data: info } = await axios.get(
+    `https://api.telegram.org/bot${token}/getFile?file_id=${fileId}`
+  );
   const filePath = info.result.file_path;
-  const fileUrl = `https://api.telegram.org/file/bot${token}/${filePath}`;
-  const { data } = await axios.get(fileUrl, { responseType: 'arraybuffer' });
+  const { data } = await axios.get(
+    `https://api.telegram.org/file/bot${token}/${filePath}`,
+    { responseType: 'arraybuffer' }
+  );
   return Buffer.from(data);
 }
 
-// ── /start ───────────────────────────────────────────────────────────────────
-bot.start(ctx => {
-  state.set(ctx.chat.id, { step: 'wait_test' });
-  return ctx.reply(
-    '👋 Welcome to the *PDF Quiz Converter Bot*!\n\n' +
-    'I convert your Test PDF + Solution PDF into a clean formatted `.txt` file.\n\n' +
-    '📋 *Step 1:* Send me the *TEST PDF* (question booklet)',
-    { parse_mode: 'Markdown' }
-  );
-});
+// Edit a message safely (ignore errors)
+async function editMsg(ctx, msgId, text, extra = {}) {
+  try {
+    await ctx.telegram.editMessageText(ctx.chat.id, msgId, null, text, extra);
+  } catch (_) {}
+}
 
-// ── /reset ───────────────────────────────────────────────────────────────────
-bot.command('reset', ctx => {
-  state.set(ctx.chat.id, { step: 'wait_test' });
-  return ctx.reply('🔄 Reset! Send me the *TEST PDF* to start again.', { parse_mode: 'Markdown' });
-});
+function registerHandlers(bot) {
 
-// ── /help ────────────────────────────────────────────────────────────────────
-bot.command('help', ctx => {
-  return ctx.reply(
-    '*How to use:*\n\n' +
-    '1️⃣ Send /start\n' +
-    '2️⃣ Upload the *TEST PDF* (questions with options a/b/c/d)\n' +
-    '3️⃣ Upload the *SOLUTION PDF* (answer key + explanations)\n' +
-    '4️⃣ Receive your formatted `.txt` file ✅\n\n' +
-    'Use /reset to start over at any time.',
-    { parse_mode: 'Markdown' }
-  );
-});
+  // /start
+  bot.start(ctx => {
+    state.set(ctx.chat.id, { step: 'wait_test' });
+    return ctx.reply(
+      '👋 *PDF Quiz Converter Bot*\n\n' +
+      'I convert your Test + Solution PDFs into a clean `.txt` file.\n\n' +
+      '📋 *Step 1:* Send me the *TEST PDF* (question booklet with a/b/c/d options)',
+      { parse_mode: 'Markdown' }
+    );
+  });
 
-// ── Document handler ─────────────────────────────────────────────────────────
-bot.on('document', async ctx => {
-  const chatId = ctx.chat.id;
-  const doc = ctx.message.document;
+  // /reset
+  bot.command('reset', ctx => {
+    state.set(ctx.chat.id, { step: 'wait_test' });
+    return ctx.reply('🔄 Reset done! Now send me the *TEST PDF*.', { parse_mode: 'Markdown' });
+  });
 
-  // Ensure user has started
-  if (!state.has(chatId)) {
-    state.set(chatId, { step: 'wait_test' });
-    return ctx.reply('Please send /start first to begin.');
-  }
+  // /help
+  bot.command('help', ctx => {
+    return ctx.reply(
+      '*How to use:*\n\n' +
+      '1️⃣ /start\n' +
+      '2️⃣ Upload *TEST PDF* (questions with a/b/c/d)\n' +
+      '3️⃣ Upload *SOLUTION PDF* (answer key + explanations)\n' +
+      '4️⃣ Get your formatted `.txt` file ✅\n\n' +
+      'Use /reset to start over.',
+      { parse_mode: 'Markdown' }
+    );
+  });
 
-  const s = state.get(chatId);
+  // Document upload handler
+  bot.on('document', async ctx => {
+    const chatId = ctx.chat.id;
+    const doc = ctx.message.document;
 
-  // Only accept PDFs
-  if (!doc.file_name.toLowerCase().endsWith('.pdf') && doc.mime_type !== 'application/pdf') {
-    return ctx.reply('⚠️ Please send a *PDF* file.', { parse_mode: 'Markdown' });
-  }
-
-  // ── Step 1: Receive TEST PDF ───────────────────────────────────
-  if (s.step === 'wait_test') {
-    const processing = await ctx.reply('📥 Received TEST PDF. Downloading...');
-    try {
-      const buffer = await downloadFile(doc.file_id);
-      state.set(chatId, { step: 'wait_sol', testBuffer: buffer, testName: doc.file_name });
-      await ctx.telegram.editMessageText(
-        chatId, processing.message_id, null,
-        '✅ TEST PDF saved!\n\n💡 *Step 2:* Now send me the *SOLUTION PDF* (answer key + explanations)',
-        { parse_mode: 'Markdown' }
-      );
-    } catch (err) {
-      await ctx.telegram.editMessageText(chatId, processing.message_id, null,
-        '❌ Failed to download the PDF. Please try again.');
-      console.error('Download error:', err.message);
-    }
-    return;
-  }
-
-  // ── Step 2: Receive SOLUTION PDF → process both ────────────────
-  if (s.step === 'wait_sol') {
-    const processing = await ctx.reply('📥 Received SOLUTION PDF. Processing both files...\n\n⏳ This may take 20–40 seconds, please wait.');
-    try {
-      // Download solution PDF
-      const solBuffer = await downloadFile(doc.file_id);
-
-      // Parse TEST PDF
-      await ctx.telegram.editMessageText(chatId, processing.message_id, null,
-        '⚙️ Parsing questions from TEST PDF...');
-      const questions = await parseTestPdf(s.testBuffer);
-      const qCount = Object.keys(questions).length;
-
-      if (qCount === 0) {
-        state.set(chatId, { step: 'wait_test' });
-        return ctx.telegram.editMessageText(chatId, processing.message_id, null,
-          '❌ No questions found in the TEST PDF.\n\nMake sure the TEST PDF has options (a), (b), (c), (d).\n\nSend /start to try again.');
-      }
-
-      // Parse SOLUTION PDF
-      await ctx.telegram.editMessageText(chatId, processing.message_id, null,
-        `✅ Found ${qCount} questions.\n⚙️ Parsing answers and explanations...`);
-      const { answers, explanations } = await parseSolutionPdf(solBuffer);
-
-      if (Object.keys(answers).length === 0) {
-        state.set(chatId, { step: 'wait_test' });
-        return ctx.telegram.editMessageText(chatId, processing.message_id, null,
-          '❌ No answer key found in the SOLUTION PDF.\n\nMake sure the SOLUTION PDF has the answer key table.\n\nSend /start to try again.');
-      }
-
-      // Build output
-      await ctx.telegram.editMessageText(chatId, processing.message_id, null,
-        '✅ Answers parsed. Building formatted output...');
-      const { text, total, matched, noAns, noExpl } = buildOutput(questions, answers, explanations);
-
-      // Send the .txt file
-      const baseName = s.testName.replace(/\.pdf$/i, '');
-      const fileName = baseName + '_CONVERTED.txt';
-      const fileBuffer = Buffer.from(text, 'utf-8');
-
-      await ctx.telegram.editMessageText(chatId, processing.message_id, null,
-        `✅ *Done!*\n\n📊 *Stats:*\n• Total questions: ${total}\n• Matched with explanation: ${matched}\n• Missing answers: ${noAns}\n• Missing explanations: ${noExpl}\n\n📄 Sending your file...`,
-        { parse_mode: 'Markdown' }
-      );
-
-      await ctx.replyWithDocument(
-        { source: fileBuffer, filename: fileName },
-        { caption: `✅ Here is your converted file: *${fileName}*`, parse_mode: 'Markdown' }
-      );
-
-      // Reset state for next conversion
+    if (!state.has(chatId)) {
       state.set(chatId, { step: 'wait_test' });
-      await ctx.reply('🔄 Ready for another conversion! Send /start to begin again.');
-
-    } catch (err) {
-      console.error('Processing error:', err);
-      state.set(chatId, { step: 'wait_test' });
-      await ctx.telegram.editMessageText(chatId, processing.message_id, null,
-        `❌ An error occurred while processing:\n${err.message}\n\nSend /start to try again.`
-      ).catch(() => {});
+      return ctx.reply('Send /start first to begin.');
     }
-    return;
-  }
 
-  // Default: user sent a file but step is unknown
-  return ctx.reply('Please send /start to begin.');
-});
+    const isPdf = doc.file_name?.toLowerCase().endsWith('.pdf') ||
+                  doc.mime_type === 'application/pdf';
+    if (!isPdf) {
+      return ctx.reply('⚠️ Please send a *PDF* file only.', { parse_mode: 'Markdown' });
+    }
 
-// ── Fallback for text messages ───────────────────────────────────────────────
-bot.on('message', ctx => {
-  const s = state.get(ctx.chat.id);
-  const step = s ? s.step : 'wait_test';
-  if (step === 'wait_test') {
-    return ctx.reply('📋 Please send the *TEST PDF* file (question booklet).', { parse_mode: 'Markdown' });
-  }
-  if (step === 'wait_sol') {
-    return ctx.reply('💡 Please send the *SOLUTION PDF* file (answer key + explanations).', { parse_mode: 'Markdown' });
-  }
-  return ctx.reply('Send /start to begin.');
-});
+    const s = state.get(chatId);
 
-// ── Vercel serverless handler ────────────────────────────────────────────────
+    // ── Step 1: TEST PDF ──────────────────────────────────────────
+    if (s.step === 'wait_test') {
+      const msg = await ctx.reply('📥 Downloading TEST PDF...');
+      try {
+        const buffer = await downloadFile(doc.file_id);
+        state.set(chatId, { step: 'wait_sol', testBuffer: buffer, testName: doc.file_name });
+        await editMsg(ctx, msg.message_id,
+          '✅ TEST PDF received!\n\n💡 *Step 2:* Now send the *SOLUTION PDF* (answer key + explanations)',
+          { parse_mode: 'Markdown' }
+        );
+      } catch (err) {
+        await editMsg(ctx, msg.message_id, '❌ Download failed. Please try again.');
+        console.error('Download error (test):', err.message);
+      }
+      return;
+    }
+
+    // ── Step 2: SOLUTION PDF → process both ──────────────────────
+    if (s.step === 'wait_sol') {
+      const msg = await ctx.reply('📥 Downloading Solution PDF...\n⏳ Processing may take 30-50 seconds, please wait.');
+      try {
+        const solBuffer = await downloadFile(doc.file_id);
+
+        await editMsg(ctx, msg.message_id, '⚙️ Parsing questions from TEST PDF...');
+        const questions = await parseTestPdf(s.testBuffer);
+        const qCount = Object.keys(questions).length;
+
+        if (qCount === 0) {
+          state.set(chatId, { step: 'wait_test' });
+          return editMsg(ctx, msg.message_id,
+            '❌ No questions found in TEST PDF.\n\nMake sure it has (a) (b) (c) (d) options.\n\nSend /start to try again.'
+          );
+        }
+
+        await editMsg(ctx, msg.message_id, `✅ Found ${qCount} questions.\n⚙️ Parsing answers and explanations...`);
+        const { answers, explanations } = await parseSolutionPdf(solBuffer);
+
+        if (Object.keys(answers).length === 0) {
+          state.set(chatId, { step: 'wait_test' });
+          return editMsg(ctx, msg.message_id,
+            '❌ No answer key found in Solution PDF.\n\nMake sure it has the answer key table.\n\nSend /start to try again.'
+          );
+        }
+
+        await editMsg(ctx, msg.message_id, '✅ Building formatted output...');
+        const { text, total, matched, noAns, noExpl } = buildOutput(questions, answers, explanations);
+
+        await editMsg(ctx, msg.message_id,
+          `✅ *Done!*\n\n📊 *Stats:*\n• Total questions: ${total}\n• Matched with explanation: ${matched}\n• Missing answers: ${noAns}\n• Missing explanations: ${noExpl}\n\n📄 Sending file...`,
+          { parse_mode: 'Markdown' }
+        );
+
+        const baseName = (s.testName || 'output').replace(/\.pdf$/i, '');
+        await ctx.replyWithDocument(
+          { source: Buffer.from(text, 'utf-8'), filename: baseName + '_CONVERTED.txt' },
+          { caption: `✅ *${baseName}_CONVERTED.txt*`, parse_mode: 'Markdown' }
+        );
+
+        state.set(chatId, { step: 'wait_test' });
+        await ctx.reply('🔄 Ready for another! Send /start to convert again.');
+
+      } catch (err) {
+        console.error('Processing error:', err);
+        state.set(chatId, { step: 'wait_test' });
+        await editMsg(ctx, msg.message_id,
+          `❌ Error: ${err.message}\n\nSend /start to try again.`
+        );
+      }
+      return;
+    }
+
+    return ctx.reply('Send /start to begin.');
+  });
+
+  // Text message fallback
+  bot.on('message', ctx => {
+    const s = state.get(ctx.chat.id);
+    const step = s?.step || 'none';
+    if (step === 'wait_test') return ctx.reply('📋 Please send the *TEST PDF* file.', { parse_mode: 'Markdown' });
+    if (step === 'wait_sol') return ctx.reply('💡 Please send the *SOLUTION PDF* file.', { parse_mode: 'Markdown' });
+    return ctx.reply('Send /start to begin.');
+  });
+}
+
+// Vercel serverless entry point
 module.exports = async (req, res) => {
   if (req.method === 'POST') {
     try {
-      await bot.handleUpdate(req.body);
+      await getBot().handleUpdate(req.body);
       res.status(200).json({ ok: true });
     } catch (err) {
-      console.error('Bot error:', err);
-      res.status(200).json({ ok: false });
+      console.error('Webhook error:', err);
+      res.status(200).json({ ok: false, error: err.message });
     }
   } else {
-    res.status(200).send('Bot is running ✅');
+    res.status(200).send('✅ Bot is running');
   }
 };
